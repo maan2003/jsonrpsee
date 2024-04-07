@@ -52,7 +52,7 @@ use jsonrpsee_types::{InvalidRequestId, ResponseSuccess, TwoPointZero};
 use manager::RequestManager;
 use std::sync::Arc;
 
-use async_lock::RwLock as AsyncRwLock;
+use async_lock::{RwLock as AsyncRwLock, RwLockUpgradableReadGuard};
 use async_trait::async_trait;
 use futures_timer::Delay;
 use futures_util::future::{self, Either};
@@ -150,41 +150,35 @@ impl ThreadSafeRequestManager {
 ///
 // NOTE: This is an AsyncRwLock to be &self.
 #[derive(Debug)]
-struct ErrorFromBack(AsyncRwLock<Option<ReadErrorOnce>>);
+struct ErrorFromBack(AsyncRwLock<ReadErrorOnce>);
 
 impl ErrorFromBack {
 	fn new(unread: oneshot::Receiver<Error>) -> Self {
-		Self(AsyncRwLock::new(Some(ReadErrorOnce::Unread(unread))))
+		Self(AsyncRwLock::new(ReadErrorOnce::Unread(unread)))
 	}
 
 	async fn read_error(&self) -> Error {
-		const PROOF: &str = "Option is only is used to workaround ownership issue and is always Some; qed";
-
-		if let ReadErrorOnce::Read(ref err) = self.0.read().await.as_ref().expect(PROOF) {
+		let read_lock = self.0.upgradable_read().await;
+		if let ReadErrorOnce::Read(err) = &*read_lock {
 			return Error::RestartNeeded(err.clone());
 		};
 
-		let mut write = self.0.write().await;
-		let state = write.take();
-
-		let err = match state.expect(PROOF) {
-			ReadErrorOnce::Unread(rx) => {
-				let arc_err = Arc::new(match rx.await {
-					Ok(err) => err,
-					// This should never happen because the receiving end is still alive.
-					// Before shutting down the background task a error message should
-					// be emitted.
-					Err(_) => Error::Custom(
-						"Error reason could not be found. This is a bug. Please open an issue.".to_string(),
-					),
-				});
-				*write = Some(ReadErrorOnce::Read(arc_err.clone()));
-				arc_err
-			}
-			ReadErrorOnce::Read(arc_err) => {
-				*write = Some(ReadErrorOnce::Read(arc_err.clone()));
-				arc_err
-			}
+		let mut write_lock = RwLockUpgradableReadGuard::upgrade(read_lock).await;
+		let err = {
+			let ReadErrorOnce::Unread(unread) = &mut *write_lock else {
+				unreachable!("already matched in read lock above");
+			};
+			let arc_err = Arc::new(match unread.await {
+				Ok(err) => err,
+				// This should never happen because the receiving end is still alive.
+				// Before shutting down the background task a error message should
+				// be emitted.
+				Err(_) => {
+					Error::Custom("Error reason could not be found. This is a bug. Please open an issue.".to_string())
+				}
+			});
+			*write_lock = ReadErrorOnce::Read(arc_err.clone());
+			arc_err
 		};
 
 		Error::RestartNeeded(err)
